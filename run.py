@@ -1,9 +1,58 @@
 # youtube_downloader_ui.py
 
+# --- Dependency Checker and Installer ---
+import sys
+import subprocess
+import importlib.util
+import os # Also needed early for DOWNLOAD_DIR check
+
+REQUIRED_PACKAGES = ['gradio', 'yt-dlp']
+
+def check_and_install_packages(packages):
+    """Checks if required packages are installed and installs them if not."""
+    print("--- Checking required Python packages ---")
+    all_installed = True
+    for package in packages:
+        module_name = package.split('==')[0].replace('-', '_') # Handle potential version pins and name differences
+        spec = importlib.util.find_spec(module_name)
+        if spec is None:
+            print(f"Package '{package}' not found. Attempting installation using pip...")
+            try:
+                # Ensure pip is run for the current Python interpreter
+                # Use check_call to raise an error if installation fails
+                subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+                print(f"Successfully installed '{package}'.")
+                # Optional: Verify again after installation
+                spec = importlib.util.find_spec(module_name)
+                if spec is None:
+                    print(f"!! ERROR: Installation of '{package}' reported success, but the module '{module_name}' still cannot be found.")
+                    all_installed = False
+            except subprocess.CalledProcessError as e:
+                print(f"!! ERROR: Failed to install '{package}' using pip.")
+                print(f"   Command failed: {' '.join(e.cmd)}")
+                # You might want to add more detailed error handling or advice here
+                all_installed = False
+            except Exception as e:
+                print(f"!! ERROR: An unexpected error occurred during installation of '{package}': {e}")
+                all_installed = False
+        else:
+            print(f"Package '{package}' is already installed.")
+    print("--- Package check complete ---")
+    return all_installed
+
+# Run the check before importing the packages
+if not check_and_install_packages(REQUIRED_PACKAGES):
+    print("\nOne or more required packages could not be installed automatically.")
+    print("Please try installing them manually (e.g., using 'pip install gradio yt-dlp')")
+    print("Also ensure you have the necessary permissions to install packages.")
+    sys.exit(1) # Exit the script if dependencies are missing and couldn't be installed
+
+# --- Now proceed with the rest of the imports and the script ---
+print("All required packages are available. Starting the application...")
+
 import gradio as gr
 import yt_dlp
-import subprocess
-import os
+import subprocess # Already imported, but fine to list again for clarity
 import json
 import re
 import tempfile
@@ -16,11 +65,17 @@ import traceback # Import traceback for better error logging
 DOWNLOAD_DIR = "YT_Downloads"
 # Ensure download directory exists at script startup
 try:
+    # Use os.makedirs which handles nested directories and doesn't raise error if exists
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    # Check write permissions more explicitly
+    if not os.access(DOWNLOAD_DIR, os.W_OK):
+        raise OSError(f"Write permission denied for directory '{DOWNLOAD_DIR}'")
+    print(f"Download directory '{DOWNLOAD_DIR}' is ready.")
 except OSError as e:
-    print(f"Error creating download directory '{DOWNLOAD_DIR}': {e}")
-    print("Please check permissions or create the directory manually.")
-    # exit(1) # Uncomment to exit if directory creation fails
+    print(f"!! ERROR creating/accessing download directory '{DOWNLOAD_DIR}': {e}")
+    print("   Please check permissions or create the directory manually in a location you can write to.")
+    print("   You might need to modify the DOWNLOAD_DIR variable in the script.")
+    sys.exit(1) # Exit if the download directory is problematic
 
 # --- Helper Functions ---
 
@@ -390,7 +445,7 @@ def download_and_convert(url, download_type, video_format_id, audio_format_id, s
 
                 # Playlist progress info
                 playlist_idx = d.get('playlist_index')
-                playlist_count = d.get('playlist_autonumber')
+                playlist_count = d.get('playlist_autonumber') # Preferred over playlist_count for yt-dlp
 
                 # Construct description string
                 desc = f"{percent_str} of '{filename}'"
@@ -399,7 +454,8 @@ def download_and_convert(url, download_type, video_format_id, audio_format_id, s
 
                 # Update Gradio progress bar
                 if playlist_idx is not None and playlist_count is not None and playlist_count > 0:
-                     overall_progress = max(0.0, min(1.0, ( (playlist_idx - 1) / playlist_count) + (percent / playlist_count)))
+                     # Make sure playlist_idx is 1-based for calculation
+                     overall_progress = max(0.0, min(1.0, ((playlist_idx - 1) / playlist_count) + (percent / playlist_count)))
                      desc = f"Playlist {playlist_idx}/{playlist_count}: {desc}"
                      progress(overall_progress, desc=desc)
                 else:
@@ -430,7 +486,7 @@ def download_and_convert(url, download_type, video_format_id, audio_format_id, s
             ],
             'subtitleslangs': subtitle_langs,
             'writesubtitles': bool(subtitle_langs),
-            'writeautomaticsub': False,
+            'writeautomaticsub': False, # Usually don't want auto-generated subs unless requested
             'subtitlesformat': 'srt/vtt/best',
             'progress_hooks': [custom_progress_hook],
             'ffmpeg_location': shutil.which('ffmpeg'),
@@ -530,7 +586,14 @@ def download_and_convert(url, download_type, video_format_id, audio_format_id, s
                 if download_type == "Single Video": download_success = False
                 # For playlists, partial success might be okay, keep success True if some files downloaded.
                 # Check if output dir exists and has files? Too complex here. Assume partial success possible.
-                if download_type == "Playlist": download_success = True # Allow partial playlist success
+                if download_type == "Playlist":
+                    # If files were created in the playlist dir, consider it partially successful
+                    if final_output_location and os.path.exists(final_output_location) and len(os.listdir(final_output_location)) > 0:
+                         download_success = True # Allow partial playlist success if files exist
+                         error_log.append("Note: Some playlist items may have failed to download.")
+                    else:
+                         download_success = False # No files created, consider it a failure
+
 
         except yt_dlp.utils.DownloadError as e:
             error_msg = f"DownloadError occurred: {e}"
@@ -677,30 +740,30 @@ def download_and_convert(url, download_type, video_format_id, audio_format_id, s
             if download_success and download_type == "Single Video" and not moved_video_file:
                  # This indicates a problem finding/moving the file after download
                  final_status_message += "\n\nCRITICAL: Main video file move failed after download."
-            elif download_type == "Playlist":
+            elif download_type == "Playlist" and download_success: # If playlist finished with errors but files exist
                  final_status_message += f"\n\nPlaylist download to '{final_output_location}' may be incomplete. Check the folder."
+            elif download_type == "Playlist" and not download_success: # If playlist failed outright
+                 final_status_message += f"\n\nPlaylist download to '{final_output_location}' failed. No files may have been saved."
             final_status_message = "⚠️ " + final_status_message # Add warning icon
 
         # Check overall success for final message
-        # Allow partial playlist success even if errors occurred
-        overall_success = (download_success and not error_log) or \
+        # Overall success = (Single Video success AND video moved) OR (Playlist success)
+        overall_success = (download_type == "Single Video" and download_success and moved_video_file) or \
                           (download_type == "Playlist" and download_success)
+
 
         if overall_success:
              if download_type == "Playlist":
-                  # If there were errors, mention possible skips
                   completion_note = "(possibly with skipped items if errors occurred)" if error_log else "successfully"
                   final_status_message = f"✅ Playlist download completed {completion_note}.\nFiles are in: '{final_output_location}'"
-             elif download_type == "Single Video" and moved_video_file: # Full success for single video
+             elif download_type == "Single Video": # Implicitly moved_video_file is True here
                   final_status_message = f"✅ Single video download completed successfully.\nVideo: {os.path.basename(final_output_location)}"
                   if subtitle_files_list:
                        final_status_message += "\nSubtitles:\n- " + "\n- ".join([os.path.basename(s) for s in subtitle_files_list])
-             # If somehow we get here without error log but video wasn't moved (shouldn't happen)
-             elif download_type == "Single Video" and not moved_video_file and not error_log:
-                 final_status_message = "❓ Download finished, but final video file move failed unexpectedly."
+
         elif not error_log: # If download failed but no specific error was logged
              final_status_message = "❌ Download process failed for an unknown reason. Check console output."
-        # If !overall_success and error_log exists, the final_status_message already contains the errors
+        # If !overall_success and error_log exists, the final_status_message already contains the errors/warnings
 
 
         # --- 5. Prepare Return Values ---
@@ -762,7 +825,6 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue", secondary_hue="gray")) a
                 ["Single Video", "Playlist"], value="Single Video", label="Download Type", info="Select 'Playlist' if URL contains 'list='"
             )
 
-    # REMOVED icon="🔍"
     fetch_button = gr.Button("① Fetch Video/Playlist Options", variant="secondary")
 
     # Use Accordion for options, start closed
@@ -773,7 +835,6 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue", secondary_hue="gray")) a
              audio_quality_dropdown = gr.Dropdown(label="Audio Quality", choices=[], interactive=False, info="Requires merging w/ video.")
         subtitle_checkboxgroup = gr.CheckboxGroup(label="Subtitles (Native Only, if available)", choices=[], interactive=False)
 
-    # REMOVED icon="⬇️", ensure label is correct
     download_button = gr.Button("③ Start Download", variant="primary", interactive=True) # Start enabled
 
     gr.Markdown("---") # Separator
@@ -842,11 +903,12 @@ if __name__ == "__main__":
         print("   Merging video/audio and some post-processing features WILL FAIL.")
         print("   Please install FFmpeg and ensure it's added to your PATH environment variable.")
 
-    # Verify download directory write permissions
-    if not os.access(abs_download_dir, os.W_OK):
-         print(f"❌ Error: Cannot write to download directory: {abs_download_dir}")
-         print("   Please check directory permissions or choose a different location.")
-         # exit(1) # Optional: exit if cannot write
+    # Verify download directory write permissions (already checked after creation, but good to have here too)
+    abs_download_dir = os.path.abspath(DOWNLOAD_DIR) # Ensure we use the absolute path
+    if not os.path.isdir(abs_download_dir) or not os.access(abs_download_dir, os.W_OK):
+         print(f"❌ Error: Download directory '{abs_download_dir}' is not accessible or writable.")
+         print("   The script might have failed to create it, or permissions are incorrect.")
+         sys.exit(1)
 
     print(f"💾 Downloads will be saved to: {abs_download_dir}")
     print(f"💡 Gradio UI File Access: Allowing access to '{abs_download_dir}' for file display.")
